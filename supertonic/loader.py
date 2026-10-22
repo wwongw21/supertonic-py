@@ -6,6 +6,7 @@ and voice styles from HuggingFace Hub.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -104,18 +105,60 @@ def has_all_onnx_modules(model_dir: Union[Path, str]) -> bool:
     return all_exist
 
 
+def _path_entry_exists(path: Path) -> bool:
+    """Check for a directory entry without treating inspection errors as absence."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
 @contextmanager
-def _model_download_lock(model_dir: Path) -> Iterator[None]:
-    """Prevent simultaneous refreshes from publishing to the same model path."""
+def _model_download_lock(model_dir: Path, *, allow_read_only: bool = False) -> Iterator[None]:
+    """Prevent refreshes from publishing while a model is recovered or checked."""
     lock_path = model_dir.parent / f".{model_dir.name}.download.lock"
-    lock_file = lock_path.open("a+b")
+    read_only_lock_file = False
+    try:
+        lock_file = lock_path.open("a+b")
+    except PermissionError:
+        if not allow_read_only:
+            raise
+
+        lock_exists = _path_entry_exists(lock_path)
+        if lock_exists and lock_path.is_symlink():
+            raise
+
+        if lock_exists:
+            # The persistent lock file can still serialize readers and writers
+            # when this installation can read, but cannot append to, the file.
+            lock_file = lock_path.open("rb")
+            read_only_lock_file = True
+        else:
+            marker = _transaction_path(model_dir)
+            parent = model_dir.parent
+            if (
+                _path_entry_exists(marker)
+                or os.access(parent, os.W_OK | os.X_OK)
+                or not os.access(parent, os.R_OK | os.X_OK)
+            ):
+                # An absent marker is not enough: a writer may start after the
+                # check. Without a lock file, only a parent this process cannot
+                # write to rules out a new refresh under the same permissions.
+                raise
+
+            # No lock file means no writer has started; the read-only parent
+            # prevents one from starting. Pending or suspicious journals above
+            # fail closed because they cannot be recovered without the lock.
+            yield
+            return
 
     try:
         if os.name == "nt":
             import msvcrt
 
             lock_file.seek(0, os.SEEK_END)
-            if lock_file.tell() == 0:
+            if lock_file.tell() == 0 and not read_only_lock_file:
                 lock_file.write(b"\0")
                 lock_file.flush()
             lock_file.seek(0)
@@ -308,6 +351,27 @@ def _validate_downloaded_model(snapshot_dir: Path) -> None:
             raise ValueError(f"Downloaded model has an invalid voice style: {path}") from e
 
 
+def _materialize_downloaded_symlinks(snapshot_dir: Path) -> None:
+    """Copy Hub-managed symlinks in owned model folders into the staging tree."""
+    for relative_dir in _MODEL_MANAGED_DIRECTORIES:
+        directory = snapshot_dir / relative_dir
+        if not directory.is_dir():
+            continue
+        for path in list(directory.rglob("*")):
+            if not path.is_symlink():
+                continue
+            if not path.is_file():
+                raise ValueError(f"Downloaded model contains an invalid file link: {path}")
+
+            materialized = path.with_name(f".{path.name}.copy-{uuid.uuid4().hex}")
+            try:
+                shutil.copyfile(path, materialized)
+                os.replace(materialized, path)
+            finally:
+                if materialized.exists():
+                    materialized.unlink()
+
+
 def _publish_downloaded_model(model_dir: Path, snapshot_dir: Path) -> None:
     """Publish only model-owned directories, preserving custom and unrelated files."""
     if model_dir.is_symlink() or (model_dir.exists() and not model_dir.is_dir()):
@@ -426,7 +490,21 @@ def download_model(model_dir: Union[Path, str], model_name: Optional[str] = None
                     revision[:12],
                     temp_dir,
                 )
-                snapshot_download(repo_id=repo_id, local_dir=str(temp_dir), revision=revision)
+                download_options = {
+                    "repo_id": repo_id,
+                    "local_dir": str(temp_dir),
+                    "revision": revision,
+                }
+                try:
+                    supported_options = inspect.signature(snapshot_download).parameters
+                except (TypeError, ValueError):
+                    supported_options = {}
+                if "local_dir_use_symlinks" in supported_options:
+                    # Older Hub versions default to symlinking files over 5 MiB.
+                    # Newer versions removed the option, so feature-detect it.
+                    download_options["local_dir_use_symlinks"] = False
+                snapshot_download(**download_options)
+                _materialize_downloaded_symlinks(temp_dir)
                 _validate_downloaded_model(temp_dir)
                 _publish_downloaded_model(model_dir, temp_dir)
                 logger.info("Model download completed successfully")
@@ -617,7 +695,15 @@ def load_model(
     logger.info(f"Loading model from {model_dir}")
     model_dir = Path(model_dir) if isinstance(model_dir, str) else model_dir
 
-    if not has_all_onnx_modules(model_dir):
+    # A previous process may have stopped between publishing ONNX assets and
+    # voice styles. Recover that transaction before the ONNX-only completeness
+    # check can incorrectly make the partial model look ready.
+    model_dir.parent.mkdir(parents=True, exist_ok=True)
+    with _model_download_lock(model_dir, allow_read_only=True):
+        _recover_model_download(model_dir)
+        model_is_complete = has_all_onnx_modules(model_dir)
+
+    if not model_is_complete:
         if not auto_download:
             logger.error(f"ONNX models not found in {model_dir}")
             raise FileNotFoundError(

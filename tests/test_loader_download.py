@@ -73,6 +73,31 @@ def _fake_hub(monkeypatch, writer):
     monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
 
 
+def _deny_lock_file_write(monkeypatch, lock_path: Path, *, parent_writable: bool) -> None:
+    original_open = Path.open
+    original_access = os.access
+
+    def deny_append(path, mode="r", *args, **kwargs):
+        if Path(path) == lock_path and mode == "a+b":
+            raise PermissionError("simulated read-only model directory")
+        return original_open(path, mode, *args, **kwargs)
+
+    def check_access(path, mode):
+        if Path(path) == lock_path.parent and mode & os.W_OK:
+            return parent_writable
+        return original_access(path, mode)
+
+    monkeypatch.setattr(Path, "open", deny_append)
+    monkeypatch.setattr(loader.os, "access", check_access)
+
+
+def _stub_model_loading(monkeypatch) -> None:
+    monkeypatch.setattr(loader, "load_configs", lambda *_args: {})
+    monkeypatch.setattr(loader, "load_onnx_modules", lambda *_args, **_kwargs: (1, 2, 3, 4))
+    monkeypatch.setattr(loader, "load_text_processor", lambda *_args: object())
+    monkeypatch.setattr(loader, "Supertonic", lambda *_args: "loaded-engine")
+
+
 def test_download_preserves_custom_styles_and_unmanaged_files(monkeypatch, tmp_path):
     model_dir = tmp_path / "model"
     _write_model_tree(model_dir, "old")
@@ -122,6 +147,69 @@ def test_repeated_download_updates_model_and_cleans_its_staging_dirs(monkeypatch
     assert json.loads((model_dir / CFG_REL_PATH).read_text(encoding="utf-8"))["version"] == "second"
     assert not list(tmp_path.glob(".model.download-*"))
     assert not list(tmp_path.glob(".model.backup-*"))
+
+
+def test_older_huggingface_hub_uses_regular_files(monkeypatch, tmp_path):
+    model_dir = tmp_path / "model"
+    symlink_options = []
+
+    def old_snapshot_download(*, repo_id, local_dir, revision, local_dir_use_symlinks="auto"):
+        symlink_options.append(local_dir_use_symlinks)
+        _write_model_tree(Path(local_dir), "old-hub")
+
+    _fake_hub(monkeypatch, old_snapshot_download)
+
+    loader.download_model(model_dir)
+
+    assert symlink_options == [False]
+    assert all(
+        not path.is_symlink()
+        for managed_dir in (model_dir / "onnx", model_dir / VOICE_STYLES_DIR)
+        for path in managed_dir.rglob("*")
+        if path.is_file()
+    )
+
+
+def test_newer_huggingface_signature_does_not_receive_removed_symlink_option(monkeypatch, tmp_path):
+    model_dir = tmp_path / "model"
+
+    def current_snapshot_download(*, repo_id, local_dir, revision):
+        _write_model_tree(Path(local_dir), "new-hub")
+
+    _fake_hub(monkeypatch, current_snapshot_download)
+
+    loader.download_model(model_dir)
+
+    assert (
+        json.loads((model_dir / CFG_REL_PATH).read_text(encoding="utf-8"))["version"] == "new-hub"
+    )
+
+
+def test_download_materializes_hub_symlinks_without_changing_cache_target(monkeypatch, tmp_path):
+    model_dir = tmp_path / "model"
+    cache_target = tmp_path / "hub-cache" / "large-model.onnx"
+    cache_target.parent.mkdir()
+    cache_target.write_bytes(b"cached ONNX content")
+
+    def fake_snapshot_download(*, local_dir, **_kwargs):
+        snapshot = Path(local_dir)
+        _write_model_tree(snapshot, "linked")
+        staged_weight = snapshot / DP_ONNX_REL_PATH
+        staged_weight.unlink()
+        try:
+            os.symlink(cache_target, staged_weight)
+        except OSError as error:
+            pytest.skip(f"file symlinks are unavailable on this Windows host: {error}")
+
+    _fake_hub(monkeypatch, fake_snapshot_download)
+
+    loader.download_model(model_dir)
+
+    published_weight = model_dir / DP_ONNX_REL_PATH
+    assert published_weight.is_file()
+    assert not published_weight.is_symlink()
+    assert published_weight.read_bytes() == b"cached ONNX content"
+    assert cache_target.read_bytes() == b"cached ONNX content"
 
 
 def test_partial_download_failure_keeps_previous_model_and_cleans_stage(monkeypatch, tmp_path):
@@ -253,7 +341,121 @@ def test_concurrent_download_returns_clear_conflict(monkeypatch, tmp_path):
     assert json.loads((model_dir / CFG_REL_PATH).read_text(encoding="utf-8"))["version"] == "new"
 
 
-def test_retry_recovers_an_interrupted_publish_and_leaves_old_dirs_untouched(monkeypatch, tmp_path):
+def test_load_model_allows_complete_read_only_model_without_lock_file(monkeypatch, tmp_path):
+    model_dir = tmp_path / "model"
+    _write_model_tree(model_dir, "installed")
+    lock_path = tmp_path / ".model.download.lock"
+    _deny_lock_file_write(monkeypatch, lock_path, parent_writable=False)
+    _stub_model_loading(monkeypatch)
+
+    assert loader.load_model(model_dir, auto_download=False) == "loaded-engine"
+    assert not lock_path.exists()
+
+
+def test_load_model_does_not_skip_lock_when_writable_parent_denies_creation(monkeypatch, tmp_path):
+    model_dir = tmp_path / "model"
+    _write_model_tree(model_dir, "installed")
+    lock_path = tmp_path / ".model.download.lock"
+    _deny_lock_file_write(monkeypatch, lock_path, parent_writable=True)
+
+    with pytest.raises(PermissionError, match="simulated read-only model directory"):
+        loader.load_model(model_dir, auto_download=False)
+
+
+def test_load_model_does_not_skip_pending_journal_when_lock_is_unavailable(monkeypatch, tmp_path):
+    model_dir = tmp_path / "model"
+    _write_model_tree(model_dir, "installed")
+    marker = loader._transaction_path(model_dir)
+    marker.write_text("{}", encoding="utf-8")
+    lock_path = tmp_path / ".model.download.lock"
+    _deny_lock_file_write(monkeypatch, lock_path, parent_writable=False)
+
+    with pytest.raises(PermissionError, match="simulated read-only model directory"):
+        loader.load_model(model_dir, auto_download=False)
+
+    assert marker.read_text(encoding="utf-8") == "{}"
+
+
+def test_read_only_lock_fallback_does_not_bypass_active_refresh(monkeypatch, tmp_path):
+    model_dir = tmp_path / "model"
+    _write_model_tree(model_dir, "installed")
+    lock_path = tmp_path / ".model.download.lock"
+    lock_path.write_bytes(b"\0")
+
+    with loader._model_download_lock(model_dir):
+        _deny_lock_file_write(monkeypatch, lock_path, parent_writable=False)
+        with pytest.raises(RuntimeError, match="already in progress"):
+            loader.load_model(model_dir, auto_download=False)
+
+
+def test_load_model_recovers_after_onnx_publish_before_completeness_check(monkeypatch, tmp_path):
+    model_dir = tmp_path / "model"
+    _write_model_tree(model_dir, "old")
+    custom_bytes = _seed_custom_style(model_dir / "custom_styles")
+    staged_roots = []
+    download_calls = 0
+
+    def fake_snapshot_download(*, local_dir, **_kwargs):
+        nonlocal download_calls
+        download_calls += 1
+        staged_roots.append(Path(local_dir))
+        _write_model_tree(Path(local_dir), "new")
+
+    _fake_hub(monkeypatch, fake_snapshot_download)
+    replace = os.replace
+
+    def interrupt_before_voice_styles_publish(source, destination):
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if (
+            staged_roots
+            and source_path == staged_roots[0] / VOICE_STYLES_DIR
+            and destination_path == model_dir / VOICE_STYLES_DIR
+        ):
+            raise KeyboardInterrupt("simulated interruption after ONNX publish")
+        return replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", interrupt_before_voice_styles_publish)
+    with pytest.raises(KeyboardInterrupt, match="after ONNX publish"):
+        loader.download_model(model_dir)
+    monkeypatch.setattr(os, "replace", replace)
+
+    # This ONNX-only predicate was already true before recovery used to run.
+    assert has_all_onnx_modules(model_dir)
+    assert not (model_dir / VOICE_STYLES_DIR / "M1.json").exists()
+
+    loaded_versions = []
+    original_load_configs = loader.load_configs
+
+    def record_loaded_config(path):
+        configs = original_load_configs(path)
+        loaded_versions.append(configs["version"])
+        return configs
+
+    def fake_load_onnx_modules(path, *_args, **_kwargs):
+        assert (Path(path) / VOICE_STYLES_DIR / "M1.json").is_file()
+        return (1, 2, 3, 4)
+
+    monkeypatch.setattr(loader, "load_configs", record_loaded_config)
+    monkeypatch.setattr(loader, "load_onnx_modules", fake_load_onnx_modules)
+    monkeypatch.setattr(loader, "load_text_processor", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        loader, "Supertonic", lambda configs, *_args, **_kwargs: f"{configs['version']}-loaded"
+    )
+    _deny_lock_file_write(monkeypatch, tmp_path / ".model.download.lock", parent_writable=True)
+
+    result = loader.load_model(model_dir, auto_download=True)
+
+    assert result == "old-loaded"
+    assert loaded_versions == ["old"]
+    assert download_calls == 1
+    assert (model_dir / "custom_styles" / "ImportedVoice.json").read_bytes() == custom_bytes
+    assert not (tmp_path / ".model.download-transaction.json").exists()
+
+
+def test_retry_recovers_an_interruption_after_onnx_publish_and_leaves_stale_dirs_untouched(
+    monkeypatch, tmp_path
+):
     model_dir = tmp_path / "model"
     _write_model_tree(model_dir, "old")
     custom_bytes = _seed_custom_style(model_dir / "custom_styles")
@@ -276,20 +478,25 @@ def test_retry_recovers_an_interrupted_publish_and_leaves_old_dirs_untouched(mon
     _fake_hub(monkeypatch, fake_snapshot_download)
     replace = os.replace
 
-    def interrupt_after_first_managed_dir(source, destination):
+    def interrupt_before_voice_styles_publish(source, destination):
         source_path = Path(source)
         destination_path = Path(destination)
         if (
             staged_roots
-            and source_path == staged_roots[0] / "onnx"
-            and destination_path == model_dir / "onnx"
+            and source_path == staged_roots[0] / VOICE_STYLES_DIR
+            and destination_path == model_dir / VOICE_STYLES_DIR
         ):
-            raise KeyboardInterrupt("simulated process interruption")
+            raise KeyboardInterrupt("simulated interruption after ONNX publish")
         return replace(source, destination)
 
-    monkeypatch.setattr(os, "replace", interrupt_after_first_managed_dir)
-    with pytest.raises(KeyboardInterrupt, match="simulated process interruption"):
+    monkeypatch.setattr(os, "replace", interrupt_before_voice_styles_publish)
+    with pytest.raises(KeyboardInterrupt, match="after ONNX publish"):
         loader.download_model(model_dir)
+
+    # This is the dangerous intermediate state: all ONNX paths exist, but the
+    # prior voice_styles directory is still in the transaction backup.
+    assert has_all_onnx_modules(model_dir)
+    assert not (model_dir / VOICE_STYLES_DIR / "M1.json").exists()
 
     monkeypatch.setattr(os, "replace", replace)
     loader.download_model(model_dir)

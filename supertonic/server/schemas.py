@@ -54,7 +54,7 @@ class OpenAISpeechRequest(BaseModel):
 
 class BatchItem(BaseModel):
     text: str = Field(..., min_length=1)
-    voice: str = Field("M1")
+    voice: Optional[str] = None
     lang: Optional[str] = None
     speed: Optional[float] = Field(None, ge=0.7, le=2.0)
     steps: Optional[int] = Field(None, ge=1, le=100)

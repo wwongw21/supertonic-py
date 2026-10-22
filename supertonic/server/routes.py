@@ -62,10 +62,10 @@ logger = logging.getLogger(__name__)
 # voice-style JSONs are ~290 kB; 1 MiB leaves comfortable headroom while
 # bounding any single request's memory footprint. Enforced twice:
 #
-# 1. as a middleware-level ``Content-Length`` pre-flight check (so an
-#    oversized request is rejected before the body is buffered), and
-# 2. inside the import handler via ``file.read(MAX+1)`` (a fallback for
-#    chunked transfer encoding where ``Content-Length`` is absent).
+# 1. by the ASGI middleware over actual received bytes before FastAPI parses
+#    JSON or multipart data (with Content-Length as an early pre-flight), and
+# 2. inside the multipart handler via ``file.read(MAX+1)`` as a file-byte
+#    defense-in-depth check.
 MAX_STYLE_IMPORT_BYTES = 1 * 1024 * 1024
 
 
@@ -215,8 +215,8 @@ def register_routes(app: FastAPI) -> None:
         if ct.startswith("multipart/form-data"):
             if file is None:
                 return _error(400, "missing 'file' part", "missing_file")
-            # Read with an explicit cap as a fallback for chunked uploads
-            # that bypass the middleware's Content-Length pre-flight check.
+            # Keep a file-byte cap as defense in depth after the raw request
+            # cap has run before FastAPI's multipart parser.
             raw = await file.read(MAX_STYLE_IMPORT_BYTES + 1)
             if len(raw) > MAX_STYLE_IMPORT_BYTES:
                 return _error(
@@ -362,7 +362,13 @@ def register_routes(app: FastAPI) -> None:
         defaults = req.defaults
         results: list[BatchResultItem] = []
         for idx, item in enumerate(req.items):
-            voice = item.voice or (defaults.voice if defaults else None) or "M1"
+            voice = (
+                item.voice
+                if item.voice is not None
+                else (
+                    defaults.voice if defaults is not None and defaults.voice is not None else "M1"
+                )
+            )
             lang = item.lang or (defaults.lang if defaults else None)
             speed = item.speed if item.speed is not None else (defaults.speed if defaults else None)
             steps = item.steps if item.steps is not None else (defaults.steps if defaults else None)

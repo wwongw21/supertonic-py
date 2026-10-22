@@ -8,6 +8,7 @@ error envelope.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from pathlib import Path
@@ -22,6 +23,8 @@ fastapi = pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from supertonic.server import ServerState, create_app  # noqa: E402
+from supertonic.server.routes import MAX_STYLE_IMPORT_BYTES  # noqa: E402
+from supertonic.server.schemas import BatchItem  # noqa: E402
 
 SAMPLE_RATE = 44100
 
@@ -138,6 +141,33 @@ def _valid_style_payload() -> dict:
     }
 
 
+def _json_body_at_size(size: int, name: str = "boundary_voice") -> bytes:
+    body = {**_valid_style_payload(), "name": name, "ignored": ""}
+    encoded = json.dumps(body, separators=(",", ":")).encode("utf-8")
+    assert size >= len(encoded)
+    body["ignored"] = "x" * (size - len(encoded))
+    encoded = json.dumps(body, separators=(",", ":")).encode("utf-8")
+    assert len(encoded) == size
+    return encoded
+
+
+def _chunks(body: bytes, size: int = 64 * 1024):
+    return (body[offset : offset + size] for offset in range(0, len(body), size))
+
+
+def _multipart_body(payload: bytes, *, boundary: bytes = b"supertonic-test") -> bytes:
+    return (
+        b"--"
+        + boundary
+        + b'\r\nContent-Disposition: form-data; name="file"; filename="voice.json"\r\n'
+        + b"Content-Type: application/json\r\n\r\n"
+        + payload
+        + b"\r\n--"
+        + boundary
+        + b"--\r\n"
+    )
+
+
 def test_import_style_via_multipart(client, fake_state):
     state, _ = fake_state
     payload = _valid_style_payload()
@@ -168,6 +198,148 @@ def test_import_style_via_json(client):
     r = client.post("/v1/styles/import", json=payload)
     assert r.status_code == 200, r.text
     assert r.json()["name"] == "json_voice"
+
+
+def test_chunked_json_import_accepts_body_exactly_at_limit(client, fake_state):
+    state, _ = fake_state
+    body = _json_body_at_size(MAX_STYLE_IMPORT_BYTES, "exact_limit")
+    response = client.post(
+        "/v1/styles/import",
+        content=_chunks(body),
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["name"] == "exact_limit"
+    assert (state.custom_styles_dir / "exact_limit.json").exists()
+
+
+def test_chunked_json_import_rejects_limit_plus_one_before_json_parsing(client, fake_state):
+    state, _ = fake_state
+    malformed = b"{" + (b" " * MAX_STYLE_IMPORT_BYTES)
+    assert len(malformed) == MAX_STYLE_IMPORT_BYTES + 1
+
+    response = client.post(
+        "/v1/styles/import",
+        content=_chunks(malformed, size=8192),
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 413
+    assert "content-length" not in response.request.headers
+    assert response.request.headers.get("transfer-encoding") == "chunked"
+    assert response.json()["error"]["code"] == "payload_too_large"
+    assert state.custom_styles == {}
+    assert not (state.custom_styles_dir / "boundary_voice.json").exists()
+
+
+def test_understated_content_length_does_not_bypass_actual_byte_limit(client):
+    body = _json_body_at_size(MAX_STYLE_IMPORT_BYTES + 1, "understated_length")
+    response = client.post(
+        "/v1/styles/import",
+        content=_chunks(body),
+        headers={"content-type": "application/json", "content-length": "1"},
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "payload_too_large"
+
+
+def test_chunked_multipart_import_survives_body_replay(client, fake_state):
+    state, _ = fake_state
+    boundary = b"multipart-under-limit"
+    body = _multipart_body(json.dumps(_valid_style_payload()).encode(), boundary=boundary)
+    response = client.post(
+        "/v1/styles/import",
+        content=_chunks(body, size=7),
+        headers={"content-type": f"multipart/form-data; boundary={boundary.decode()}"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["name"] == "voice"
+    assert "content-length" not in response.request.headers
+    assert (state.custom_styles_dir / "voice.json").exists()
+
+
+def test_oversized_chunked_multipart_is_rejected_before_parser_or_save(
+    client, fake_state, monkeypatch
+):
+    from starlette.formparsers import MultiPartParser
+
+    state, _ = fake_state
+    boundary = b"multipart-over-limit"
+    envelope_size = len(_multipart_body(b"", boundary=boundary))
+    file_payload = _json_body_at_size(
+        MAX_STYLE_IMPORT_BYTES + 1 - envelope_size, "multipart_oversize"
+    )
+    body = _multipart_body(file_payload, boundary=boundary)
+    assert len(body) == MAX_STYLE_IMPORT_BYTES + 1
+    parse_calls = 0
+    original_parse = MultiPartParser.parse
+
+    async def track_parse(parser):
+        nonlocal parse_calls
+        parse_calls += 1
+        return await original_parse(parser)
+
+    monkeypatch.setattr(MultiPartParser, "parse", track_parse)
+    response = client.post(
+        "/v1/styles/import",
+        content=_chunks(body),
+        headers={"content-type": f"multipart/form-data; boundary={boundary.decode()}"},
+    )
+
+    assert response.status_code == 413
+    assert "content-length" not in response.request.headers
+    assert response.json()["error"]["code"] == "payload_too_large"
+    assert parse_calls == 0
+    assert state.custom_styles == {}
+    assert not (state.custom_styles_dir / "multipart_oversize.json").exists()
+
+
+def test_chunked_disconnect_does_not_import_partial_json(fake_state):
+    state, _ = fake_state
+    app = create_app(state=state)
+    messages = iter(
+        [
+            {"type": "http.request", "body": b'{"name":"partial"', "more_body": True},
+            {"type": "http.disconnect"},
+        ]
+    )
+    sent = []
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/styles/import",
+        "raw_path": b"/v1/styles/import",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"content-type", b"application/json")],
+        "client": ("testclient", 123),
+        "server": ("testserver", 80),
+    }
+
+    async def receive():
+        return next(messages)
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(app(scope, receive, send))
+
+    assert sent == []
+    assert state.custom_styles == {}
+    assert not (state.custom_styles_dir / "partial.json").exists()
+
+
+def test_large_non_import_body_is_not_subject_to_style_limit(client):
+    body = json.dumps({"text": "hello", "ignored": "x" * MAX_STYLE_IMPORT_BYTES})
+    response = client.post("/v1/tts", content=body, headers={"content-type": "application/json"})
+
+    assert response.status_code == 200, response.text
 
 
 def test_import_rejects_builtin_name(client):
@@ -369,6 +541,66 @@ def test_batch_two_items(client, fake_state):
     assert fake.calls[-1]["speed"] == pytest.approx(1.1)
     assert fake.calls[-2]["total_steps"] == 12
     assert fake.calls[-1]["total_steps"] == 12
+
+
+def test_batch_item_voice_is_optional_and_nullable_in_pydantic_schema():
+    assert BatchItem(text="hello").voice is None
+    assert BatchItem.model_validate({"text": "hello", "voice": None}).voice is None
+
+    voice_schema = BatchItem.model_json_schema()["properties"]["voice"]
+    assert voice_schema["default"] is None
+    assert any(option.get("type") == "null" for option in voice_schema["anyOf"])
+
+
+def test_batch_item_inherits_default_voice_and_keeps_explicit_m1(client, fake_state):
+    _, fake = fake_state
+    response = client.post(
+        "/v1/tts/batch",
+        json={
+            "defaults": {"voice": "F1"},
+            "items": [
+                {"text": "inherit from default"},
+                {"text": "explicit override", "voice": "M1"},
+                {"text": "null inherits", "voice": None},
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert [call["voice_style_source"] for call in fake.calls[-3:]] == [
+        "builtin:F1",
+        "builtin:M1",
+        "builtin:F1",
+    ]
+
+
+def test_batch_item_without_voice_settings_keeps_m1_default(client, fake_state):
+    _, fake = fake_state
+    response = client.post("/v1/tts/batch", json={"items": [{"text": "default voice"}]})
+
+    assert response.status_code == 200, response.text
+    assert fake.calls[-1]["voice_style_source"] == "builtin:M1"
+
+
+def test_batch_item_unknown_inherited_voice_returns_structured_error(client):
+    response = client.post(
+        "/v1/tts/batch",
+        json={"defaults": {"voice": "NOPE"}, "items": [{"text": "invalid inherited voice"}]},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "unknown_voice"
+    assert "items[0]" in response.json()["error"]["message"]
+
+
+def test_batch_explicit_empty_voice_does_not_fall_back_to_default(client):
+    response = client.post(
+        "/v1/tts/batch",
+        json={"defaults": {"voice": "F1"}, "items": [{"text": "empty", "voice": ""}]},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "unknown_voice"
 
 
 def test_batch_item_unknown_voice(client):
