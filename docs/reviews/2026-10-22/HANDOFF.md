@@ -1,10 +1,10 @@
 # supertonic-py engineering handoff
 
-Review date: **22 October 2026**. All findings remain **OPEN**. This handoff contains proposed repairs and release checks; no source fixes or new runtime acceptance are claimed.
+Review date: **22 October 2026**. All findings remain **OPEN**. This handoff contains proposed repairs and release checks; no runtime source fixes or repaired-behavior acceptance are claimed.
 
 **Reviewed source:** [`main` at `908a56486e821e833a80530ff0cae3ad0b046fce`](https://github.com/wwongw21/supertonic-py/tree/908a56486e821e833a80530ff0cae3ad0b046fce).
 
-The full structured handoff is in [report.json](report.json). Historical commands retain their original review-workspace paths; read the prerequisites before running them. Only repository-specific diagnostics listed below are attached.
+The full structured handoff is in [report.json](report.json). The historical commands and results below retain their original `/workspace` paths and are not portable reruns. Use the checked-in [standard-library reproducer](diagnostics/repro_pinned_sources.py) from the repository root; its fresh output is [captured here](evidence/portable-probe-2026-10-22.txt). It demonstrates pre-fix behavior only and does not apply runtime repairs.
 
 ## Audience and required outcome
 
@@ -704,7 +704,7 @@ wwongw21
 
 ## Handoff status
 
-All findings OPEN; repairs and acceptance checks are PROPOSED. No implementation was performed.
+All findings OPEN; runtime repairs and acceptance checks are still PROPOSED. Only the portable diagnostic and handoff evidence were added.
 
 ## Evidence boundary
 
@@ -1154,11 +1154,21 @@ All findings remain OPEN; documentation transfer only.
 
 ### Portable evidence
 
-This JSON retains the complete repository-specific handoff. Historical /workspace paths are evidence references and prerequisites, not portable hyperlinks. Applicable repository-specific diagnostics are included alongside the report.
+The historical `/workspace` commands and outputs remain unchanged as records of the original review. The new portable run is separate; it records its UTC time, Python/OS, source pin, and LF-normalized SHA-256 hashes for every source file it executes.
 
 ### Diagnostics included
 
-None recorded.
+Run from the repository root with Python 3.9 or later:
+
+```text
+python docs/reviews/2026-10-22/diagnostics/repro_pinned_sources.py
+```
+
+The probe uses only the Python standard library. It AST-extracts the pinned downloader, batch voice default and resolver, import middleware and handler, and chunking helper. It mocks the Hugging Face download, style store, and request/ASGI boundary. No HTTP client, model package, model weights, network request, or application file write is used. The source hash checks normalize CRLF to LF, so they work from Windows and LF checkouts.
+
+The captured run reproduced these pre-fix results: the downloader removed a seeded custom voice while publishing a mocked snapshot; the batch resolver selected M1 when the batch default was F1 and the item omitted its voice; a 1,048,704-byte chunked JSON body without Content-Length reached the mocked handler and returned its success status; and `chunk_text("word " * 400, max_len=300)` returned a 1,999-character chunk. The SPY-3 status comes from the mocked handler boundary, not an HTTP client run.
+
+The evidence is [portable-probe-2026-10-22.txt](evidence/portable-probe-2026-10-22.txt). It is a new source-level reproduction and does not replace the historical run results above.
 
 ### Not included
 
@@ -1166,7 +1176,7 @@ Original environments, model weights, user data and complete source snapshots ar
 
 ### Combined probe
 
-The historical repro_supertonic.py depends on both public Supertonic checkouts. It is not included as a repository-specific diagnostic; the report records the original results and the regression scenarios to implement.
+The historical `repro_supertonic.py` still is not included. This repository now contains a self-contained probe for its four recorded `supertonic-py` observations; the sibling `supertonic` repository has a separate probe for the two Python example observations. Each run checks its own pinned source hashes.
 
 
 ## Remaining review limits
@@ -1177,5 +1187,5 @@ The historical repro_supertonic.py depends on both public Supertonic checkouts. 
 
 3. No GitHub Actions runs exist on these forks according to root's connector query; this is absent evidence, not a failing CI result.
 
-4. Repository source files were not edited; test imports may generate ignored __pycache__ files.
+4. Runtime source files were not edited; the historical test imports may generate ignored __pycache__ files.
 

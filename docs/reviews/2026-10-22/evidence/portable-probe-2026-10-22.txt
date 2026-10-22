@@ -1,0 +1,16 @@
+Portable pre-fix reproduction; source functions are AST-extracted from pinned files.
+invocation=python docs/reviews/2026-10-22/diagnostics/repro_pinned_sources.py
+run_utc=2026-10-22T15:09:05+00:00
+python=3.14.7; platform=Windows 11
+repository=supertonic-py; source_pin=908a56486e821e833a80530ff0cae3ad0b046fce
+hash_method=SHA-256 of UTF-8 source bytes after CRLF-to-LF normalization
+source_sha256=9478b085ccae88fd44849a87d8a55d0ddada03e4fbb7f47f1707f04ac06e621f  path=supertonic/loader.py
+source_sha256=c678f17799777f08193212f66df8394e123789b01c1a5b22eb7898b46984c3db  path=supertonic/server/schemas.py
+source_sha256=6dceb93c9a7fb6766fded4b3ec4f0ad09c5ae655aab4a0f3d4c8755accc65720  path=supertonic/server/routes.py
+source_sha256=11e9c7b9961922167d585c4e4f1ce3275f796f33d41ca2ebdc3da72094a324e0  path=supertonic/server/app.py
+source_sha256=8bf2e0a14783de9266edba1135597e6b77b143907e445b08dcc45f694ff51ed3  path=supertonic/utils.py
+SPY-1 downloader: existing custom voice removed by replacement=True; mocked snapshot published=True; calls=1
+SPY-2 batch voice: defaults.voice=F1; omitted item voice receives schema default=M1; actual route resolver selects=M1
+SPY-3 chunked JSON import: bytes=1048704; Content-Length=absent; middleware=forwarded body; mocked handler status=200; mocked style store called=True
+SPY-4 chunk length: configured max=300; actual chunk lengths=[1999]
+result=all four historical source-level bug behaviors reproduced; no runtime fix applied

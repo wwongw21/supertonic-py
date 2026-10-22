@@ -87,7 +87,7 @@
     "No real model inference, synthesis quality evaluation, GPU execution, browser UI, mobile app, full native-language builds or packaged release testing.",
     "Tests use deterministic fake inference outputs and temporary user-style directories where appropriate; these reproduce control-flow/contracts rather than audio quality.",
     "No GitHub Actions runs exist on these forks according to root's connector query; this is absent evidence, not a failing CI result.",
-    "Repository source files were not edited; test imports may generate ignored __pycache__ files."
+    "Runtime source files were not edited; the historical test imports may generate ignored __pycache__ files."
   ],
   "evidence_file": "report.json",
   "ci_observation": {
@@ -140,7 +140,7 @@
     "schema_version": 1,
     "review_date": "2026-10-22",
     "owner": "wwongw21",
-    "handoff_status": "All findings OPEN; repairs and acceptance checks are PROPOSED. No implementation was performed.",
+    "handoff_status": "All findings OPEN; runtime repairs and acceptance checks are still PROPOSED. Only the portable diagnostic and handoff evidence were added.",
     "audience": [
       "Maintainer implementing corrections",
       "Reviewer checking behavior, preservation of user data and release readiness"
@@ -696,13 +696,37 @@
   },
   "handoff_date": "2026-10-22",
   "all_findings_status": "OPEN",
-  "implementation_status": "No repairs applied; proposed work only.",
+  "implementation_status": "No runtime repairs applied; only the portable diagnostic and handoff evidence were added.",
   "delivery_notes": {
     "destination_repository": "wwongw21/supertonic-py",
     "status": "All findings remain OPEN; documentation transfer only.",
-    "portable_evidence": "This JSON retains the complete repository-specific handoff. Historical /workspace paths are evidence references and prerequisites, not portable hyperlinks. Applicable repository-specific diagnostics are included alongside the report.",
-    "diagnostics_included": [],
+    "portable_evidence": "Historical /workspace commands and outputs remain unchanged. A separate portable source-level run was captured on 2026-10-22; its log records the UTC time, environment, source pin, and LF-normalized SHA-256 hashes. It does not replace or claim to be the original run.",
+    "diagnostics_included": [
+      "docs/reviews/2026-10-22/diagnostics/repro_pinned_sources.py",
+      "docs/reviews/2026-10-22/evidence/portable-probe-2026-10-22.txt"
+    ],
+    "portable_diagnostic_run": {
+      "command": "python docs/reviews/2026-10-22/diagnostics/repro_pinned_sources.py",
+      "run_utc": "2026-10-22T15:09:05+00:00",
+      "environment": "Python 3.14.7; Windows 11; Python standard library only",
+      "source_pin": "908a56486e821e833a80530ff0cae3ad0b046fce",
+      "hash_method": "SHA-256 after CRLF-to-LF normalization",
+      "source_hashes": {
+        "supertonic/loader.py": "9478b085ccae88fd44849a87d8a55d0ddada03e4fbb7f47f1707f04ac06e621f",
+        "supertonic/server/schemas.py": "c678f17799777f08193212f66df8394e123789b01c1a5b22eb7898b46984c3db",
+        "supertonic/server/routes.py": "6dceb93c9a7fb6766fded4b3ec4f0ad09c5ae655aab4a0f3d4c8755accc65720",
+        "supertonic/server/app.py": "11e9c7b9961922167d585c4e4f1ce3275f796f33d41ca2ebdc3da72094a324e0",
+        "supertonic/utils.py": "8bf2e0a14783de9266edba1135597e6b77b143907e445b08dcc45f694ff51ed3"
+      },
+      "results": [
+        "SPY-1: actual pinned downloader function removed a seeded custom voice while a mocked snapshot was published.",
+        "SPY-2: actual pinned schema default and route resolver selected M1 when defaults.voice was F1 and item.voice was omitted.",
+        "SPY-3: actual pinned middleware forwarded a 1,048,704-byte request with no Content-Length; the extracted route handler accepted it through a mocked request and style store and returned the success response class.",
+        "SPY-4: actual pinned chunk_text returned one 1,999-character chunk for max_len=300."
+      ],
+      "limits": "Source-level AST execution with mocked Hugging Face snapshot, style store, request body and response boundary. No real HTTP client, network request, model initialization, model weights, or runtime fix."
+    },
     "not_included": "Original environments, model weights, user data and complete source snapshots are not included. Clone the pinned source and follow the recorded prerequisites. Bug-demonstration scripts intentionally assert pre-fix behavior; they are not a post-fix passing suite.",
-    "combined_probe": "The historical repro_supertonic.py depends on both public Supertonic checkouts. It is not included as a repository-specific diagnostic; the report records the original results and the regression scenarios to implement."
+    "combined_probe": "The historical repro_supertonic.py remains absent and its original results remain historical. This repository now carries a focused per-repository stdlib probe for the four recorded supertonic-py source behaviors; the sibling supertonic repository carries its own probe for the Python example observations."
   }
 }
