@@ -1,8 +1,12 @@
 """Regression tests for safe model refreshes without live model downloads."""
 
+import errno
 import json
 import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 from types import ModuleType
 
@@ -73,12 +77,16 @@ def _fake_hub(monkeypatch, writer):
     monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
 
 
-def _deny_lock_file_write(monkeypatch, lock_path: Path, *, parent_writable: bool) -> None:
+def _deny_lock_file_write(
+    monkeypatch, lock_path: Path, *, parent_writable: bool, open_error=None
+) -> None:
     original_open = Path.open
     original_access = os.access
 
     def deny_append(path, mode="r", *args, **kwargs):
         if Path(path) == lock_path and mode == "a+b":
+            if open_error is not None:
+                raise open_error
             raise PermissionError("simulated read-only model directory")
         return original_open(path, mode, *args, **kwargs)
 
@@ -352,6 +360,22 @@ def test_load_model_allows_complete_read_only_model_without_lock_file(monkeypatc
     assert not lock_path.exists()
 
 
+def test_load_model_allows_read_only_model_when_lock_open_returns_erofs(monkeypatch, tmp_path):
+    model_dir = tmp_path / "model"
+    _write_model_tree(model_dir, "installed")
+    lock_path = tmp_path / ".model.download.lock"
+    _deny_lock_file_write(
+        monkeypatch,
+        lock_path,
+        parent_writable=True,
+        open_error=OSError(errno.EROFS, "read-only file system"),
+    )
+    _stub_model_loading(monkeypatch)
+
+    assert loader.load_model(model_dir, auto_download=False) == "loaded-engine"
+    assert not lock_path.exists()
+
+
 def test_load_model_does_not_skip_lock_when_writable_parent_denies_creation(monkeypatch, tmp_path):
     model_dir = tmp_path / "model"
     _write_model_tree(model_dir, "installed")
@@ -376,16 +400,116 @@ def test_load_model_does_not_skip_pending_journal_when_lock_is_unavailable(monke
     assert marker.read_text(encoding="utf-8") == "{}"
 
 
-def test_read_only_lock_fallback_does_not_bypass_active_refresh(monkeypatch, tmp_path):
+def test_read_only_fallback_does_not_bypass_pending_journal_on_erofs(monkeypatch, tmp_path):
+    model_dir = tmp_path / "model"
+    _write_model_tree(model_dir, "installed")
+    marker = loader._transaction_path(model_dir)
+    marker.write_text("{}", encoding="utf-8")
+    lock_path = tmp_path / ".model.download.lock"
+    _deny_lock_file_write(
+        monkeypatch,
+        lock_path,
+        parent_writable=True,
+        open_error=OSError(errno.EROFS, "read-only file system"),
+    )
+    monkeypatch.setattr(
+        loader,
+        "has_all_onnx_modules",
+        lambda *_args: pytest.fail("completeness checked before pending journal handling"),
+    )
+
+    with pytest.raises(OSError) as error:
+        loader.load_model(model_dir, auto_download=False)
+
+    assert error.value.errno == errno.EROFS
+    assert marker.read_text(encoding="utf-8") == "{}"
+
+
+def test_unrelated_lock_open_error_is_not_treated_as_read_only(monkeypatch, tmp_path):
+    model_dir = tmp_path / "model"
+    _write_model_tree(model_dir, "installed")
+    lock_path = tmp_path / ".model.download.lock"
+    _deny_lock_file_write(
+        monkeypatch,
+        lock_path,
+        parent_writable=False,
+        open_error=OSError(errno.EIO, "simulated disk I/O error"),
+    )
+
+    with pytest.raises(OSError) as error:
+        loader.load_model(model_dir, auto_download=False)
+
+    assert error.value.errno == errno.EIO
+
+
+def test_read_only_lock_fallback_waits_for_active_refresh(monkeypatch, tmp_path):
     model_dir = tmp_path / "model"
     _write_model_tree(model_dir, "installed")
     lock_path = tmp_path / ".model.download.lock"
     lock_path.write_bytes(b"\0")
+    _stub_model_loading(monkeypatch)
 
-    with loader._model_download_lock(model_dir):
-        _deny_lock_file_write(monkeypatch, lock_path, parent_writable=False)
-        with pytest.raises(RuntimeError, match="already in progress"):
-            loader.load_model(model_dir, auto_download=False)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with loader._model_download_lock(model_dir):
+            _deny_lock_file_write(monkeypatch, lock_path, parent_writable=False)
+            loading = pool.submit(loader.load_model, model_dir, False)
+            with pytest.raises(FutureTimeoutError):
+                loading.result(timeout=0.1)
+        assert loading.result(timeout=2) == "loaded-engine"
+
+
+def test_concurrent_loaders_wait_for_recovery_lock_and_both_succeed(monkeypatch, tmp_path):
+    model_dir = tmp_path / "model"
+    _write_model_tree(model_dir, "installed")
+    _stub_model_loading(monkeypatch)
+
+    first_inside_check = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+    check_lock = threading.Lock()
+    check_count = 0
+
+    def delayed_completeness_check(_model_dir):
+        nonlocal check_count
+        with check_lock:
+            check_count += 1
+            call_number = check_count
+        if call_number == 1:
+            first_inside_check.set()
+            assert release_first.wait(timeout=3)
+        return True
+
+    monkeypatch.setattr(loader, "has_all_onnx_modules", delayed_completeness_check)
+
+    def second_load():
+        second_started.set()
+        return loader.load_model(model_dir, auto_download=False)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(loader.load_model, model_dir, False)
+        assert first_inside_check.wait(timeout=2)
+        second = pool.submit(second_load)
+        assert second_started.wait(timeout=2)
+
+        try:
+            with pytest.raises(FutureTimeoutError):
+                second.result(timeout=0.1)
+        finally:
+            release_first.set()
+
+        assert first.result(timeout=2) == "loaded-engine"
+        assert second.result(timeout=2) == "loaded-engine"
+
+    assert check_count == 2
+
+
+def test_waiting_for_model_lock_has_a_bounded_timeout(tmp_path):
+    model_dir = tmp_path / "model"
+    outer_lock = loader._model_download_lock(model_dir)
+    expected_timeout = pytest.raises(TimeoutError, match="Timed out waiting")
+    inner_lock = loader._model_download_lock(model_dir, wait=True, wait_timeout=0.02)
+    with outer_lock, expected_timeout, inner_lock:
+        pytest.fail("the lock should remain held by the outer context")
 
 
 def test_load_model_recovers_after_onnx_publish_before_completeness_check(monkeypatch, tmp_path):

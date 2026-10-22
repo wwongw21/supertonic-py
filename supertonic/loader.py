@@ -6,12 +6,14 @@ and voice styles from HuggingFace Hub.
 
 from __future__ import annotations
 
+import errno
 import inspect
 import json
 import logging
 import os
 import shutil
 import tempfile
+import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -114,15 +116,46 @@ def _path_entry_exists(path: Path) -> bool:
     return True
 
 
+_MODEL_LOCK_WAIT_TIMEOUT_SECONDS = 30.0
+_MODEL_LOCK_POLL_INTERVAL_SECONDS = 0.05
+
+
+def _is_read_only_lock_open_error(error: OSError) -> bool:
+    return isinstance(error, PermissionError) or error.errno == errno.EROFS
+
+
+def _is_lock_contention_error(error: OSError) -> bool:
+    return error.errno in {
+        errno.EACCES,
+        errno.EAGAIN,
+        getattr(errno, "EWOULDBLOCK", errno.EAGAIN),
+        getattr(errno, "EDEADLK", -1),
+        getattr(errno, "EDEADLOCK", -1),
+    }
+
+
 @contextmanager
-def _model_download_lock(model_dir: Path, *, allow_read_only: bool = False) -> Iterator[None]:
-    """Prevent refreshes from publishing while a model is recovered or checked."""
+def _model_download_lock(
+    model_dir: Path,
+    *,
+    allow_read_only: bool = False,
+    wait: bool = False,
+    wait_timeout: float = _MODEL_LOCK_WAIT_TIMEOUT_SECONDS,
+) -> Iterator[None]:
+    """Protect model recovery/checks and fail fast for competing downloads."""
+    if wait:
+        if wait_timeout < 0:
+            raise ValueError("wait_timeout must be non-negative")
+        lock_wait_timeout = wait_timeout
+    else:
+        lock_wait_timeout = 0.0
+
     lock_path = model_dir.parent / f".{model_dir.name}.download.lock"
     read_only_lock_file = False
     try:
         lock_file = lock_path.open("a+b")
-    except PermissionError:
-        if not allow_read_only:
+    except OSError as open_error:
+        if not allow_read_only or not _is_read_only_lock_open_error(open_error):
             raise
 
         lock_exists = _path_entry_exists(lock_path)
@@ -139,12 +172,12 @@ def _model_download_lock(model_dir: Path, *, allow_read_only: bool = False) -> I
             parent = model_dir.parent
             if (
                 _path_entry_exists(marker)
-                or os.access(parent, os.W_OK | os.X_OK)
+                or (open_error.errno != errno.EROFS and os.access(parent, os.W_OK | os.X_OK))
                 or not os.access(parent, os.R_OK | os.X_OK)
             ):
                 # An absent marker is not enough: a writer may start after the
-                # check. Without a lock file, only a parent this process cannot
-                # write to rules out a new refresh under the same permissions.
+                # check. Without a lock file, a non-writable parent or an EROFS
+                # result rules out a new refresh on this filesystem.
                 raise
 
             # No lock file means no writer has started; the read-only parent
@@ -161,23 +194,50 @@ def _model_download_lock(model_dir: Path, *, allow_read_only: bool = False) -> I
             if lock_file.tell() == 0 and not read_only_lock_file:
                 lock_file.write(b"\0")
                 lock_file.flush()
-            lock_file.seek(0)
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
-
-            def unlock() -> None:
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
-
-        else:
-            import fcntl
-
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-            def unlock() -> None:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
     except OSError as e:
         lock_file.close()
+        if wait:
+            raise
         raise RuntimeError(f"Another model download is already in progress for {model_dir}") from e
+
+    deadline = time.monotonic() + lock_wait_timeout if wait else None
+    try:
+        while True:
+            try:
+                if os.name == "nt":
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+
+                    def unlock() -> None:
+                        lock_file.seek(0)
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+                    def unlock() -> None:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+                break
+            except OSError as lock_error:
+                if not wait:
+                    raise RuntimeError(
+                        f"Another model download is already in progress for {model_dir}"
+                    ) from lock_error
+                if not _is_lock_contention_error(lock_error):
+                    raise
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"Timed out waiting for the model recovery lock for {model_dir}"
+                    ) from lock_error
+                time.sleep(min(_MODEL_LOCK_POLL_INTERVAL_SECONDS, remaining))
+    except BaseException:
+        lock_file.close()
+        raise
 
     try:
         yield
@@ -699,7 +759,7 @@ def load_model(
     # voice styles. Recover that transaction before the ONNX-only completeness
     # check can incorrectly make the partial model look ready.
     model_dir.parent.mkdir(parents=True, exist_ok=True)
-    with _model_download_lock(model_dir, allow_read_only=True):
+    with _model_download_lock(model_dir, allow_read_only=True, wait=True):
         _recover_model_download(model_dir)
         model_is_complete = has_all_onnx_modules(model_dir)
 
