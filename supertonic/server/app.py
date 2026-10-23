@@ -31,20 +31,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Apply the size pre-flight to /v1/styles/import only — every other route
-# either takes small JSON bodies or returns audio (no large request body).
+# Apply the raw-body cap to /v1/styles/import only; other endpoints retain
+# their existing request limits and behavior.
 _SIZE_LIMITED_PATHS = ("/v1/styles/import",)
 
 
 class StyleImportSizeLimit:
-    """ASGI middleware: reject ``POST /v1/styles/import`` when the request
-    ``Content-Length`` exceeds :data:`MAX_STYLE_IMPORT_BYTES`.
+    """Enforce a raw-body size cap before FastAPI parses style imports.
 
-    The check runs *before* FastAPI's dependency machinery starts buffering
-    the multipart body, so a malicious or accidental oversized upload is
-    rejected at the headers stage. Requests without ``Content-Length``
-    (chunked transfer encoding) fall through; the handler's ``read(MAX+1)``
-    enforces the same cap there.
+    Content-Length is an early rejection hint only. The middleware counts the
+    actual received bytes and replays a bounded body to FastAPI, so missing or
+    understated lengths cannot bypass the cap. The limit includes multipart
+    envelope bytes.
     """
 
     def __init__(self, app, max_bytes: int) -> None:
@@ -62,24 +60,58 @@ class StyleImportSizeLimit:
             if name == b"content-length":
                 cl_raw = value
                 break
-        if cl_raw is None:
-            # Chunked transfer encoding — no header pre-flight possible.
-            return await self.app(scope, receive, send)
+        if cl_raw is not None:
+            cl_value = cl_raw.strip()
+            if not cl_value or not cl_value.isdigit():
+                return await self._send_error(
+                    send, 400, "invalid Content-Length header", "invalid_content_length"
+                )
+            try:
+                content_length = int(cl_value)
+            except ValueError:
+                return await self._send_error(
+                    send, 400, "invalid Content-Length header", "invalid_content_length"
+                )
+            if content_length > self.max_bytes:
+                return await self._send_error(
+                    send,
+                    413,
+                    f"Content-Length {content_length} exceeds {self.max_bytes} bytes",
+                    "payload_too_large",
+                )
 
-        try:
-            cl = int(cl_raw)
-        except ValueError:
-            return await self._send_error(
-                send, 400, "invalid Content-Length header", "invalid_content_length"
-            )
-        if cl > self.max_bytes:
-            return await self._send_error(
-                send,
-                413,
-                f"Content-Length {cl} exceeds {self.max_bytes} bytes",
-                "payload_too_large",
-            )
-        return await self.app(scope, receive, send)
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                # Do not parse or persist a partial body after the client leaves.
+                return
+            if message["type"] != "http.request":
+                return
+
+            chunk = message.get("body", b"")
+            if len(chunk) > self.max_bytes - len(body):
+                return await self._send_error(
+                    send,
+                    413,
+                    f"Request body exceeds {self.max_bytes} bytes",
+                    "payload_too_large",
+                )
+            body.extend(chunk)
+            if not message.get("more_body", False):
+                break
+
+        replay_body = bytes(body)
+        replayed = False
+
+        async def replay_receive():
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {"type": "http.request", "body": replay_body, "more_body": False}
+            return await receive()
+
+        return await self.app(scope, replay_receive, send)
 
     @staticmethod
     async def _send_error(send, status: int, message: str, code: str) -> None:

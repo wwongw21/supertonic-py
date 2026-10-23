@@ -147,3 +147,81 @@ def test_chunk_text_empty_after_split():
     # Should handle gracefully without creating empty chunks
     for chunk in chunks:
         assert len(chunk.strip()) > 0
+
+
+def test_chunk_text_splits_overlong_tokens_and_obeys_exact_limit():
+    exact = "x" * 10
+    overlong = exact + "y"
+
+    assert chunk_text("x" * 9, max_len=10) == ["x" * 9]
+    assert chunk_text(exact, max_len=10) == [exact]
+    chunks = chunk_text(overlong, max_len=10)
+    assert len(chunks) > 1
+    assert all(0 < len(chunk) <= 10 for chunk in chunks)
+    assert "".join(chunks) == overlong
+
+
+def test_chunk_text_splits_long_unpunctuated_words_at_whitespace():
+    text = "word " * 40
+    chunks = chunk_text(text, max_len=20)
+
+    assert len(chunks) > 1
+    assert all(0 < len(chunk) <= 20 for chunk in chunks)
+    assert "".join("".join(chunks).split()) == "".join(text.split())
+
+
+def test_chunk_text_bounds_japanese_without_ascii_spaces():
+    text = "日本語" * 50
+    chunks = chunk_text(text, max_len=31)
+
+    assert len(chunks) > 1
+    assert all(0 < len(chunk) <= 31 for chunk in chunks)
+    assert "".join(chunks) == text
+
+
+def test_chunk_text_keeps_combining_emoji_and_hangul_sequences_together():
+    decomposed = "x" * 9 + "e\u0301" + "z" * 10
+    emoji = "👨‍👩‍👧‍👦"
+    emoji_text = "x" * 9 + emoji + "z" * 10
+    tag_emoji = "🏴\U000e0067\U000e0062\U000e0065\U000e006e\U000e0067\U000e007f"
+    tag_text = "x" * 9 + tag_emoji + "z" * 10
+    regional_flag = "🇺🇸"
+    flag_text = "x" * 9 + regional_flag + "z" * 10
+    hangul_cluster = "\u1100\u1161\u11a8"
+    hangul_text = "x" * 8 + hangul_cluster * 3 + "z" * 5
+    combined_hangul = "안녕하세요" * 4
+
+    for text, cluster in (
+        (decomposed, "e\u0301"),
+        (emoji_text, emoji),
+        (tag_text, tag_emoji),
+        (flag_text, regional_flag),
+        (hangul_text, hangul_cluster),
+        (combined_hangul, "안녕"),
+    ):
+        chunks = chunk_text(text, max_len=10)
+        assert all(0 < len(chunk) <= 10 for chunk in chunks)
+        assert "".join(chunks) == text
+        assert any(cluster in chunk for chunk in chunks)
+
+
+def test_chunk_text_hard_splits_an_indivisible_cluster_over_the_limit():
+    long_joined_sequence = "👨‍" + ("👩‍" * 5) + "👧"
+    chunks = chunk_text(long_joined_sequence, max_len=10)
+
+    assert all(0 < len(chunk) <= 10 for chunk in chunks)
+    assert "".join(chunks) == long_joined_sequence
+
+
+def test_chunk_text_recognizes_unicode_sentence_punctuation_and_keeps_paragraphs():
+    japanese = "日本語です。次の文です！おしまい？"
+    assert chunk_text(japanese, max_len=100) == [japanese]
+
+    long_japanese = "日本語です。" * 25
+    long_chunks = chunk_text(long_japanese, max_len=20)
+    assert all(0 < len(chunk) <= 20 for chunk in long_chunks)
+    assert "".join(long_chunks) == long_japanese
+
+    text = "Dr. Smith arrived. He left.\n\n次の段落。まだ続く。"
+    chunks = chunk_text(text, max_len=80)
+    assert chunks == ["Dr. Smith arrived. He left.", "次の段落。まだ続く。"]
