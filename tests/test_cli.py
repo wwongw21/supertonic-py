@@ -25,6 +25,7 @@ def test_cli_no_command(capsys):
     assert exc_info.value.code == 1
 
 
+@pytest.mark.integration
 def test_cmd_list_voices(capsys):
     """Test list-voices command."""
     from argparse import Namespace
@@ -37,6 +38,7 @@ def test_cmd_list_voices(capsys):
     assert "M1" in captured.out or "F1" in captured.out
 
 
+@pytest.mark.integration
 def test_cmd_info(capsys):
     """Test info command."""
     from argparse import Namespace

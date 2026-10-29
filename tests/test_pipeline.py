@@ -5,6 +5,8 @@ import pytest
 
 from supertonic import TTS
 
+pytestmark = pytest.mark.integration
+
 
 def test_tts_init():
     """Test that TTS initializes without error."""

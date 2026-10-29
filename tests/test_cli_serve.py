@@ -87,6 +87,7 @@ def test_cmd_serve_missing_fastapi_friendly_error(monkeypatch, capsys):
 def test_cmd_serve_non_loopback_warns(monkeypatch, capsys):
     """Binding to anything other than loopback emits a stderr warning."""
     fastapi = pytest.importorskip("fastapi")  # noqa: F841
+    pytest.importorskip("uvicorn")
 
     called = {}
 
